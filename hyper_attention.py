@@ -4,12 +4,13 @@ from src.attn_utils import add_self_attentions
 from src.flash_attn_triton import flash_attn_func
 from src.hyper_attn_triton import hyper_attn_func
 from src.angular_lsh_triton import AngularLSHTriton
+import torch.backends.cuda
 
-
+torch.backends.cuda.preferred_linalg_library("default")
 class HyperAttention(torch.nn.Module):
 
     def __init__(self, input_dim=64, lsh_num_projs=8, block_size=256, sample_size=256, min_seq_len=2048,
-                 smooth_block=False, **kwargs):
+                 smooth_block=False,top_k=128, **kwargs):
         """
         - block_size and sample_size must be divisible by 128
         """
@@ -19,9 +20,47 @@ class HyperAttention(torch.nn.Module):
         self.block_size = block_size
         self.sample_size = sample_size
         self.min_seq_len = min_seq_len
+        self.top_k = top_k
         self.smooth_block = smooth_block
         self.lsh = AngularLSHTriton(num_projs=self.lsh_num_projs, dim=(1, 1, input_dim))
 
+    def compute_lev_scores(self, key):
+        """
+        Compute leverage scores and select top-k keys based on the scores.
+        """
+        batch_size, num_heads, kv_length, dim = key.shape
+
+        # Reshape for batch processing
+        key_reshaped = key.view(batch_size * num_heads, kv_length, dim)
+
+        # Convert to float32 for QR decomposition to avoid 'BFloat16' error
+        key_reshaped = key_reshaped.to(torch.float32)
+        key_reshaped = key_reshaped.contiguous()
+        # Compute QR decomposition (Orthogonalization)
+        orth_key, _ = torch.linalg.qr(key_reshaped+1e-6*torch.randn_like(key_reshaped))
+
+        # Compute leverage scores as squared norm
+        lev_scores = torch.norm(orth_key, dim=-1) ** 2
+
+        # Ensure top_k is properly initialized
+        top_k = self.top_k if self.top_k is not None else kv_length  # Default: keep all keys
+
+        _, top_indices = torch.topk(lev_scores, top_k, dim=-1, largest=True, sorted=True)
+        #print(f"Max index in top_indices: {top_indices.max().item()}, kv_length: {kv_length}")
+        #print(f"Min index in top_indices: {top_indices.min().item()}")
+        top_indices = torch.clamp(top_indices, max=kv_length - 1)
+        # ✅ Ensure `top_indices` has correct shape
+        top_indices = top_indices.view(batch_size, num_heads, top_k)
+
+        # ✅ Gather top-k keys
+        top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, dim)
+
+
+        selected_keys = torch.gather(key, dim=2, index=top_indices_expanded)
+
+        return selected_keys, top_indices  # ✅ Return both values
+
+    
     def forward(self, query: torch.tensor, key: torch.tensor, value: torch.tensor, scale=None, causal=False,
                 return_lse=False):
         """
@@ -38,7 +77,23 @@ class HyperAttention(torch.nn.Module):
         query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
+        # Get top-k keys based on Leverage Scores
+        '''selected_keys, top_indices = self.compute_lev_scores(key)
+        #print(f"selected_keys shape: {selected_keys.shape}")  # Should be (batch, num_heads, top_k, dim)
+        #print(f"top_indices shape: {top_indices.shape}")      # Should be (batch, num_heads, top_k)
+        # Select corresponding values using the same indices
+        batch_size, num_heads, kv_length, dim_v = value.shape
+        top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, dim_v)
+        selected_values = torch.gather(value, dim=2, index=top_indices_expanded)  
+        # (batch, num_heads, top_k, dim_v)
+        #selected_values = selected_values.view(batch_size, num_heads, self.top_k, dim_v)
 
+        # Apply HyperAttention with selected keys and values
+        attn, lse = self.forward_no_causal_mask(query=query, key=selected_keys, value=selected_values, scale=scale)
+        if not return_lse:
+            return attn
+        else:
+            return attn, lse'''
         n_query = query.shape[2]
         batch_size, n_heads, n_key, dim = key.shape
         scale = scale or dim ** (-0.5)
